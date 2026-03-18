@@ -18,6 +18,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [analysing, setAnalysing] = useState(false);
   const [activeTab, setActiveTab] = useState('markets');
+  const [environment, setEnvironment] = useState('demo');
 
   const wsUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
   const { data: wsData, connected } = useWebSocket(wsUrl);
@@ -31,6 +32,7 @@ function App() {
   useEffect(() => {
     api.authStatus().then((s) => {
       setAuthenticated(s.authenticated);
+      if (s.environment) setEnvironment(s.environment);
       if (s.authenticated) {
         api.getState().then(setState).catch(() => {});
       }
@@ -46,9 +48,10 @@ function App() {
     return () => clearInterval(interval);
   }, [connected, authenticated]);
 
-  const handleLogin = useCallback(async (username, password) => {
-    await api.login(username, password);
+  const handleLogin = useCallback(async (username, password, apiKey, isDemo) => {
+    const loginResult = await api.login(username, password, apiKey, isDemo);
     setAuthenticated(true);
+    setEnvironment(loginResult.environment || (isDemo ? 'demo' : 'live'));
     // Fetch initial state
     const s = await api.getState();
     setState(s);
@@ -83,6 +86,7 @@ function App() {
       console.error(err);
     }
     setAuthenticated(false);
+    setEnvironment('demo');
     setState({ running: false, trades: [], markets: {} });
   }, []);
 
@@ -105,6 +109,10 @@ function App() {
         onLogout={handleLogout}
         analysing={analysing}
         syncRetry={state.syncRetry}
+        priceAllowance={state.priceAllowance}
+        allowanceError={state.allowanceError}
+        priceCache={state.priceCache}
+        environment={environment}
       />
 
       <StatsBar trades={trades} markets={state.markets || {}} />

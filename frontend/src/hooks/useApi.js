@@ -13,10 +13,10 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  login: (username, password) =>
+  login: (username, password, apiKey, isDemo) =>
     request('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, apiKey, isDemo }),
     }),
   authStatus: () => request('/auth/status'),
   logout: () => request('/auth/logout', { method: 'POST' }),
@@ -58,4 +58,11 @@ export const api = {
     }),
   getSyncStatus: () => request('/sync/status'),
   retryDeadLetters: () => request('/sync/retry-dead', { method: 'POST' }),
+  getEpicConfig: (epic) => request(`/epic-config/${encodeURIComponent(epic)}`),
+  updateEpicConfig: (epic, config) =>
+    request(`/epic-config/${encodeURIComponent(epic)}`, {
+      method: 'POST',
+      body: JSON.stringify(config),
+    }),
+  getAllEpicConfigs: () => request('/epic-config'),
 };

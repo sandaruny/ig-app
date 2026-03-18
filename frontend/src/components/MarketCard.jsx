@@ -45,7 +45,8 @@ export default function MarketCard({ market, onSelect, onRemoved }) {
   const isUp = change >= 0;
   const isForbidden = marketStatus === 'FORBIDDEN';
   const isExpired = marketStatus === 'SESSION_EXPIRED';
-  const hasError = isForbidden || isExpired;
+  const isAllowanceExhausted = marketStatus === 'ALLOWANCE_EXHAUSTED';
+  const hasError = isForbidden || isExpired || isAllowanceExhausted;
 
   const handleRemove = async (e) => {
     e.stopPropagation();
@@ -100,12 +101,14 @@ export default function MarketCard({ market, onSelect, onRemoved }) {
         <div
           className="flex items-center justify-between gap-2 text-xs px-3 py-2 rounded-lg mb-3"
           style={{
-            background: isExpired ? 'rgba(255,171,0,0.1)' : 'rgba(255,82,82,0.1)',
-            color: isExpired ? 'var(--accent-yellow)' : 'var(--accent-red)',
+            background: (isExpired || isAllowanceExhausted) ? 'rgba(255,171,0,0.1)' : 'rgba(255,82,82,0.1)',
+            color: (isExpired || isAllowanceExhausted) ? 'var(--accent-yellow)' : 'var(--accent-red)',
           }}
         >
           <span>
-            {market.error || (isExpired
+            {market.error || (isAllowanceExhausted
+              ? 'Price data allowance exhausted — wait for weekly reset'
+              : isExpired
               ? 'Session expired — please re-login'
               : 'No access — remove from watchlist')}
           </span>
@@ -164,13 +167,14 @@ export default function MarketCard({ market, onSelect, onRemoved }) {
       {/* Key Indicators */}
       {signal?.indicators && (
         <div className="space-y-0.5">
-          <IndicatorRow label="RSI(14)" value={signal.indicators.momentum?.rsi} format={(v) => v.toFixed(1)} />
           <IndicatorRow label="MACD" value={signal.indicators.trend?.macd} />
           <IndicatorRow label="EMA 9" value={signal.indicators.trend?.ema_9} />
           <IndicatorRow label="EMA 21" value={signal.indicators.trend?.ema_21} />
-          <IndicatorRow label="BB Width" value={signal.indicators.volatility?.bb_width} />
+          <IndicatorRow label="KDJ J" value={signal.indicators.momentum?.kdj_j} format={(v) => v.toFixed(1)} />
+          <IndicatorRow label="DI+" value={signal.indicators.directional?.di_plus} format={(v) => v.toFixed(1)} />
+          <IndicatorRow label="DI-" value={signal.indicators.directional?.di_minus} format={(v) => v.toFixed(1)} />
+          <IndicatorRow label="ROC" value={signal.indicators.momentum?.roc_composite} format={(v) => `${v > 0 ? '+' : ''}${v.toFixed(2)}%`} />
           <IndicatorRow label="ATR(14)" value={signal.indicators.volatility?.atr} />
-          <IndicatorRow label="ADX" value={signal.indicators.trend?.adx} format={(v) => v.toFixed(1)} />
         </div>
       )}
 
@@ -192,7 +196,7 @@ export default function MarketCard({ market, onSelect, onRemoved }) {
       )}
 
       {/* Stop/Limit */}
-      {signal && signal.direction !== 'HOLD' && (
+      {signal && (signal.stop_points > 0 || signal.stop_distance > 0) && (
         <div className="mt-3 grid grid-cols-2 gap-2">
           <div
             className="rounded-lg px-3 py-2 text-center"
@@ -201,9 +205,14 @@ export default function MarketCard({ market, onSelect, onRemoved }) {
             <div className="text-[10px] uppercase" style={{ color: 'var(--accent-red)' }}>
               Stop Loss
             </div>
-            <div className="font-mono text-sm" style={{ color: 'var(--accent-red)' }}>
-              {signal.stop_distance}
+            <div className="font-mono text-sm font-bold" style={{ color: 'var(--accent-red)' }}>
+              {signal.stop_points != null ? `${signal.stop_points} pts` : signal.stop_distance?.toFixed(5)}
             </div>
+            {signal.stop_points != null && signal.stop_distance > 0 && (
+              <div className="text-[9px] font-mono mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                ATR: {signal.stop_distance.toFixed(5)}
+              </div>
+            )}
           </div>
           <div
             className="rounded-lg px-3 py-2 text-center"
@@ -212,9 +221,14 @@ export default function MarketCard({ market, onSelect, onRemoved }) {
             <div className="text-[10px] uppercase" style={{ color: 'var(--accent-green)' }}>
               Take Profit
             </div>
-            <div className="font-mono text-sm" style={{ color: 'var(--accent-green)' }}>
-              {signal.limit_distance}
+            <div className="font-mono text-sm font-bold" style={{ color: 'var(--accent-green)' }}>
+              {signal.limit_points != null ? `${signal.limit_points} pts` : signal.limit_distance?.toFixed(5)}
             </div>
+            {signal.limit_points != null && signal.limit_distance > 0 && (
+              <div className="text-[9px] font-mono mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                ATR: {signal.limit_distance.toFixed(5)}
+              </div>
+            )}
           </div>
         </div>
       )}

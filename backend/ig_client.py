@@ -6,6 +6,22 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+class PriceAllowanceExhausted(Exception):
+    """Raised when the weekly IG historical price data allowance is used up."""
+
+    def __init__(self, remaining: int, total: int, expiry_secs: int | None):
+        self.remaining = remaining
+        self.total = total
+        self.expiry_secs = expiry_secs
+        mins = (expiry_secs // 60) if expiry_secs else "?"
+        hours = (expiry_secs // 3600) if expiry_secs else "?"
+        super().__init__(
+            f"IG price data allowance exhausted ({remaining}/{total}). "
+            f"Resets in ~{hours}h ({mins}min). "
+            f"Reduce analysis frequency or wait for reset."
+        )
+
+
 class IGClient:
     """Client for IG Trading REST API with automatic session management."""
 
@@ -22,6 +38,13 @@ class IGClient:
         self._username: str | None = None
         self._password: str | None = None
         self._reauth_lock = asyncio.Lock()
+
+        # Price data allowance tracking (IG limits to 10,000 points/week)
+        self.price_allowance: dict = {
+            "remaining": None,    # None = unknown until first price response
+            "total": 10000,
+            "expiry_secs": None,  # seconds until allowance resets
+        }
 
     def _headers(self, version: int = 1) -> dict:
         headers = {
@@ -134,6 +157,7 @@ class IGClient:
             kwargs["params"] = params
 
         resp = await self._client.request(method, url, **kwargs)
+        logger.debug("Request %s %s → %d", method, url, resp.status_code)
 
         # 401 = session expired → try re-auth once
         if resp.status_code == 401 and self.can_reauth:
@@ -169,20 +193,94 @@ class IGClient:
         resp.raise_for_status()
         return resp.json()
 
+    # IG error codes that indicate the weekly price data limit is hit
+    _ALLOWANCE_ERROR_CODES = {
+        "error.public-api.exceeded-account-historical-data-allowance",
+        "error.public-api.exceeded-api-key-allowance",
+    }
+
     async def get_prices(
         self,
         epic: str,
         resolution: str = "HOUR",
         num_points: int = 50,
     ) -> dict:
-        """Fetch historical prices for technical analysis."""
+        """Fetch historical prices for technical analysis.
+
+        Tracks the weekly price data allowance from the response and raises
+        PriceAllowanceExhausted when the limit is hit.
+        """
+        # If we already know the allowance is exhausted, fail fast
+        if (self.price_allowance["remaining"] is not None
+                and self.price_allowance["remaining"] <= 0):
+            raise PriceAllowanceExhausted(
+                remaining=0,
+                total=self.price_allowance["total"],
+                expiry_secs=self.price_allowance["expiry_secs"],
+            )
+
         resp = await self._request_with_reauth(
             "GET",
             f"{self.base_url}/prices/{epic}/{resolution}/{num_points}",
             version=2,
         )
+
+        # On 403, inspect the response body to distinguish allowance
+        # exhaustion from genuine market-level access denial
+        if resp.status_code == 403:
+            error_code = ""
+            try:
+                error_body = resp.json()
+                error_code = error_body.get("errorCode", "")
+            except Exception:
+                pass
+
+            if error_code in self._ALLOWANCE_ERROR_CODES:
+                # Mark allowance as exhausted
+                self.price_allowance["remaining"] = 0
+                logger.error(
+                    "IG price data allowance EXHAUSTED (errorCode=%s). "
+                    "All price requests will fail until weekly reset.",
+                    error_code,
+                )
+                raise PriceAllowanceExhausted(
+                    remaining=0,
+                    total=self.price_allowance["total"],
+                    expiry_secs=self.price_allowance["expiry_secs"],
+                )
+
+            # Not an allowance issue — genuine market 403
+            logger.warning("403 for %s: %s", epic, error_code or "unknown")
+            resp.raise_for_status()
+
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+
+        # Update allowance tracking from the response
+        allowance = data.get("allowance")
+        if allowance:
+            self.price_allowance["remaining"] = allowance.get("remainingAllowance")
+            self.price_allowance["total"] = allowance.get("totalAllowance", 10000)
+            self.price_allowance["expiry_secs"] = allowance.get("allowanceExpiry")
+            remaining = self.price_allowance["remaining"]
+            total = self.price_allowance["total"]
+            if remaining is not None:
+                if remaining <= 0:
+                    logger.error(
+                        "IG price data allowance EXHAUSTED (0/%d). "
+                        "Resets in %s seconds.",
+                        total, self.price_allowance["expiry_secs"],
+                    )
+                elif remaining < total * 0.1:
+                    logger.warning(
+                        "IG price data allowance LOW: %d/%d remaining (%.0f%%). "
+                        "Resets in %s seconds.",
+                        remaining, total,
+                        (remaining / total) * 100,
+                        self.price_allowance["expiry_secs"],
+                    )
+
+        return data
 
     async def get_open_positions(self) -> list[dict]:
         resp = await self._request_with_reauth(

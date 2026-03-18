@@ -96,25 +96,51 @@ app.add_middleware(
 # --- REST Endpoints ---
 
 
+DEMO_URL = "https://demo-api.ig.com/gateway/deal"
+LIVE_URL = "https://api.ig.com/gateway/deal"
+
+
 @app.post("/api/auth/login")
 async def login(body: dict):
-    """Login to IG API with username and password."""
+    """Login to IG API with username, password, API key, and environment."""
+    global ig_client, auto_trader
+
     username = body.get("username", settings.ig_username)
     password = body.get("password", settings.ig_password)
+    api_key = body.get("apiKey", "").strip() or settings.ig_api_key
+    is_demo = body.get("isDemo", True)
+
     if not username or not password:
         raise HTTPException(400, "Username and password required")
+    if not api_key:
+        raise HTTPException(400, "API key is required")
+
+    # Determine the base URL from environment choice
+    base_url = DEMO_URL if is_demo else LIVE_URL
+
+    # Recreate the IG client with the chosen API key and environment
+    if ig_client:
+        try:
+            await ig_client.close()
+        except Exception:
+            pass
+    ig_client = IGClient(api_key=api_key, base_url=base_url)
+
     try:
         result = await ig_client.login(username, password)
     except Exception as e:
         raise HTTPException(401, f"Login failed: {e}")
+
+    # Recreate the trader with the new client
+    auto_trader = AutoTrader(ig_client)
 
     # Save credentials to DB (don't let DB errors break the login response)
     try:
         db.save_credentials(
             username=username,
             password=password,
-            api_key=ig_client.api_key,
-            api_url=ig_client.base_url,
+            api_key=api_key,
+            api_url=base_url,
         )
     except Exception as e:
         logger.error("Failed to save credentials to DB: %s", e)
@@ -123,16 +149,21 @@ async def login(body: dict):
         "status": "ok",
         "accountId": ig_client.account_id,
         "lightstreamerEndpoint": ig_client.lightstreamer_endpoint,
+        "environment": "demo" if is_demo else "live",
     }
 
 
 @app.get("/api/auth/status")
 async def auth_status():
+    is_demo = ig_client.base_url == DEMO_URL if ig_client else True
+    saved = db.load_credentials()
     return {
         "authenticated": ig_client.is_authenticated if ig_client else False,
-        "hasSavedCredentials": db.load_credentials() is not None,
+        "hasSavedCredentials": saved is not None,
         "canAutoReauth": ig_client.can_reauth if ig_client else False,
         "accountId": ig_client.account_id if ig_client else None,
+        "environment": "demo" if is_demo else "live",
+        "apiKey": ig_client.api_key if ig_client else "",
     }
 
 
@@ -175,10 +206,13 @@ async def trader_state():
 
 @app.post("/api/trader/analyse")
 async def trigger_analysis():
-    """Manually trigger analysis cycle."""
+    """Manually trigger analysis cycle (analyse only — no trades placed).
+
+    Trades are only executed when the bot is running via Start.
+    """
     if not ig_client or not ig_client.is_authenticated:
         raise HTTPException(401, "Not authenticated")
-    await auto_trader.analyse_and_trade()
+    await auto_trader.analyse_and_trade(execute_trades=False)
     return auto_trader.get_state()
 
 
@@ -233,6 +267,19 @@ async def retry_dead_letters():
     """Move all dead-letter items back to the retry queue."""
     count = sync_queue.retry_dead()
     return {"status": "ok", "requeued": count}
+
+
+@app.get("/api/allowance")
+async def get_price_allowance():
+    """Return the current IG historical price data allowance status."""
+    if not ig_client:
+        return {"remaining": None, "total": 10000, "expirySecs": None}
+    a = ig_client.price_allowance
+    return {
+        "remaining": a.get("remaining"),
+        "total": a.get("total", 10000),
+        "expirySecs": a.get("expiry_secs"),
+    }
 
 
 @app.get("/api/trades/history")
@@ -299,6 +346,32 @@ async def update_config(body: dict):
     if body.get("flushSyncQueue"):
         sync_queue.flush_now()
     return {"status": "updated", "syncRetry": sync_queue.get_status()}
+
+
+# --- Per-Epic Config (ROC period, etc.) ---
+
+
+@app.get("/api/epic-config")
+async def get_all_epic_configs():
+    """Return all per-epic indicator configurations."""
+    return {"configs": db.load_epic_configs()}
+
+
+@app.get("/api/epic-config/{epic:path}")
+async def get_epic_config(epic: str):
+    """Return config for a single epic."""
+    roc = db.get_epic_roc_period(epic, default=20)
+    return {"epic": epic, "rocPeriod": roc}
+
+
+@app.post("/api/epic-config/{epic:path}")
+async def update_epic_config(epic: str, body: dict):
+    """Update config for a single epic."""
+    roc = int(body.get("rocPeriod", 20))
+    roc = max(5, min(100, roc))  # Clamp to reasonable range
+    db.save_epic_config(epic, roc)
+    logger.info("Updated epic config for %s: ROC period = %d", epic, roc)
+    return {"status": "updated", "epic": epic, "rocPeriod": roc}
 
 
 # --- Market Search & Watchlist Management ---
@@ -375,16 +448,17 @@ async def add_to_watchlist(body: dict):
     if epic in settings.currency_pairs:
         return {"status": "already_exists", "pairs": settings.currency_pairs}
 
-    # Validate: check we can actually fetch price data for this epic
+    # Validate: check we can access this market using /markets/{epic}
+    # (does NOT consume the limited weekly price data allowance)
     if ig_client and ig_client.is_authenticated:
         try:
             resp = await ig_client._request_with_reauth(
                 "GET",
-                f"{ig_client.base_url}/prices/{epic}/HOUR/1",
-                version=2,
+                f"{ig_client.base_url}/markets/{epic}",
+                version=3,
             )
             if resp.status_code == 403:
-                logger.warning("Cannot add %s — 403 on price data (not available on demo)", epic)
+                logger.warning("Cannot add %s — 403 on market details (not available on demo)", epic)
                 return {
                     "status": "forbidden",
                     "error": "This market is not available on your demo account. Try the CFD variant instead.",

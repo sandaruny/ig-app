@@ -48,6 +48,12 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS epic_config (
+                epic TEXT PRIMARY KEY,
+                roc_period INTEGER DEFAULT 20,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 deal_id TEXT UNIQUE NOT NULL,
@@ -419,6 +425,49 @@ def get_trade_by_deal_id(deal_id: str) -> dict | None:
             "opened_at": r["opened_at"],
             "closed_at": r["closed_at"],
         }
+    finally:
+        conn.close()
+
+
+# ── Epic Config (per-epic indicator settings) ─────────────────
+
+
+def save_epic_config(epic: str, roc_period: int):
+    """Save per-epic indicator configuration."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO epic_config (epic, roc_period, updated_at)
+               VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(epic) DO UPDATE SET
+                   roc_period = excluded.roc_period,
+                   updated_at = CURRENT_TIMESTAMP
+            """,
+            (epic, roc_period),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_epic_configs() -> dict[str, dict]:
+    """Load all per-epic configs. Returns {epic: {"roc_period": int}}."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("SELECT epic, roc_period FROM epic_config").fetchall()
+        return {r["epic"]: {"roc_period": r["roc_period"]} for r in rows}
+    finally:
+        conn.close()
+
+
+def get_epic_roc_period(epic: str, default: int = 20) -> int:
+    """Get the ROC period for a specific epic, or the default."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT roc_period FROM epic_config WHERE epic = ?", (epic,)
+        ).fetchone()
+        return row["roc_period"] if row else default
     finally:
         conn.close()
 

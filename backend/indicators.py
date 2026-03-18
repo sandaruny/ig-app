@@ -3,10 +3,14 @@ import numpy as np
 import ta
 
 
-def compute_indicators(prices_data: dict) -> pd.DataFrame:
+def compute_indicators(prices_data: dict, roc_period: int = 20) -> pd.DataFrame:
     """
     Compute technical indicators from IG price data.
     Returns a DataFrame with OHLC + all indicator columns.
+
+    Args:
+        prices_data: IG price API response dict with "prices" key
+        roc_period: The primary ROC lookback period (configurable per epic, default 20)
     """
     prices = prices_data.get("prices", [])
     if not prices:
@@ -54,7 +58,10 @@ def compute_indicators(prices_data: dict) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    # --- Trend Indicators ---
+    # ═══════════════════════════════════════════════════════════════
+    # 1. TREND INDICATORS
+    # ═══════════════════════════════════════════════════════════════
+
     # EMA 9, 21, 50
     df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
     df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
@@ -66,26 +73,82 @@ def compute_indicators(prices_data: dict) -> pd.DataFrame:
     df["macd_signal"] = macd.macd_signal()
     df["macd_histogram"] = macd.macd_diff()
 
-    # ADX
+    # ADX (Average Directional Index) — kept for trend strength
     if len(df) >= 14:
-        adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14)
-        df["adx"] = adx.adx()
-        df["adx_pos"] = adx.adx_pos()
-        df["adx_neg"] = adx.adx_neg()
+        adx_ind = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14)
+        df["adx"] = adx_ind.adx()
+        df["adx_pos"] = adx_ind.adx_pos()
+        df["adx_neg"] = adx_ind.adx_neg()
 
-    # --- Momentum Indicators ---
-    # RSI
-    df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+    # ═══════════════════════════════════════════════════════════════
+    # 2. DIRECTIONAL MOVEMENT (DI+, DI-, DX)
+    #    Wilder's Directional Movement System — measures the strength
+    #    and direction of a trend using +DM / -DM smoothed over N bars.
+    #    - DI+ > DI- → bullish pressure dominates
+    #    - DI- > DI+ → bearish pressure dominates
+    #    - DX = |DI+ - DI-| / (DI+ + DI-) × 100 → normalised strength
+    # ═══════════════════════════════════════════════════════════════
+    if len(df) >= 14:
+        # +DM and -DM raw
+        df["_plus_dm"] = df["high"].diff()
+        df["_minus_dm"] = -df["low"].diff()
+        # Only keep the larger of the two when both are positive
+        df["_plus_dm"] = df.apply(
+            lambda r: r["_plus_dm"] if r["_plus_dm"] > 0 and r["_plus_dm"] > r["_minus_dm"] else 0,
+            axis=1,
+        )
+        df["_minus_dm"] = df.apply(
+            lambda r: r["_minus_dm"] if r["_minus_dm"] > 0 and r["_minus_dm"] > r["_plus_dm"] else 0,
+            axis=1,
+        )
+        # True Range for normalisation
+        tr = pd.DataFrame({
+            "hl": df["high"] - df["low"],
+            "hc": (df["high"] - df["close"].shift(1)).abs(),
+            "lc": (df["low"] - df["close"].shift(1)).abs(),
+        }).max(axis=1)
+        # Wilder smoothing (14-period)
+        n = 14
+        atr_sm = tr.ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
+        plus_dm_sm = df["_plus_dm"].ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
+        minus_dm_sm = df["_minus_dm"].ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
+        df["di_plus"] = 100 * (plus_dm_sm / atr_sm)
+        df["di_minus"] = 100 * (minus_dm_sm / atr_sm)
+        di_sum = df["di_plus"] + df["di_minus"]
+        df["dx"] = 100 * ((df["di_plus"] - df["di_minus"]).abs() / di_sum.replace(0, np.nan))
+        # Clean up temp columns
+        df.drop(columns=["_plus_dm", "_minus_dm"], inplace=True)
 
-    # Stochastic Oscillator
+    # ═══════════════════════════════════════════════════════════════
+    # 3. MOMENTUM INDICATORS
+    # ═══════════════════════════════════════════════════════════════
+
+    # KDJ Indicator
+    #   K and D are the standard Stochastic %K / %D.
+    #   J = 3×K − 2×D  (amplifies the divergence between K and D)
+    #   J > 100 → strongly overbought
+    #   J < 0   → strongly oversold
+    #   J crossing K from below → buy signal
     if len(df) >= 14:
         stoch = ta.momentum.StochasticOscillator(
+            df["high"], df["low"], df["close"], window=9, smooth_window=3
+        )
+        df["kdj_k"] = stoch.stoch()
+        df["kdj_d"] = stoch.stoch_signal()
+        df["kdj_j"] = 3 * df["kdj_k"] - 2 * df["kdj_d"]
+
+    # Stochastic Oscillator (classic 14/3)
+    if len(df) >= 14:
+        stoch14 = ta.momentum.StochasticOscillator(
             df["high"], df["low"], df["close"], window=14, smooth_window=3
         )
-        df["stoch_k"] = stoch.stoch()
-        df["stoch_d"] = stoch.stoch_signal()
+        df["stoch_k"] = stoch14.stoch()
+        df["stoch_d"] = stoch14.stoch_signal()
 
-    # --- Volatility Indicators ---
+    # ═══════════════════════════════════════════════════════════════
+    # 4. VOLATILITY INDICATORS
+    # ═══════════════════════════════════════════════════════════════
+
     # Bollinger Bands
     bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
     df["bb_upper"] = bb.bollinger_hband()
@@ -93,21 +156,26 @@ def compute_indicators(prices_data: dict) -> pd.DataFrame:
     df["bb_lower"] = bb.bollinger_lband()
     df["bb_width"] = bb.bollinger_wband()
 
-    # ATR (Average True Range) - used for stop loss calculation
+    # ATR (Average True Range) — used for stop loss calculation
     if len(df) >= 14:
         atr = ta.volatility.AverageTrueRange(
             df["high"], df["low"], df["close"], window=14
         )
         df["atr"] = atr.average_true_range()
 
-    # --- Rate of Change (ROC) — Multi-timeframe momentum ---
-    # Fast ROC (9): short-term momentum / entry signal
-    df["roc_fast"] = ta.momentum.roc(df["close"], window=9)
-    # Medium ROC (14): standard momentum confirmation
-    df["roc_medium"] = ta.momentum.roc(df["close"], window=min(14, len(df) - 1))
-    # Slow ROC (30): trend-level momentum filter
-    if len(df) >= 31:
-        df["roc_slow"] = ta.momentum.roc(df["close"], window=30)
+    # ═══════════════════════════════════════════════════════════════
+    # 5. RATE OF CHANGE (ROC) — Configurable primary period
+    #    The roc_period (default 20) is the "primary" timeframe.
+    #    Fast = roc_period // 2  (short-term entry timing)
+    #    Slow = roc_period * 2   (trend-level filter)
+    # ═══════════════════════════════════════════════════════════════
+    fast_period = max(5, roc_period // 2)
+    slow_period = roc_period * 2
+
+    df["roc_fast"] = ta.momentum.roc(df["close"], window=fast_period)
+    df["roc_medium"] = ta.momentum.roc(df["close"], window=min(roc_period, len(df) - 1))
+    if len(df) >= slow_period + 1:
+        df["roc_slow"] = ta.momentum.roc(df["close"], window=slow_period)
     # Composite ROC score: weighted blend → 50% fast + 30% medium + 20% slow
     if "roc_slow" in df.columns:
         df["roc_composite"] = (
@@ -123,7 +191,9 @@ def compute_indicators(prices_data: dict) -> pd.DataFrame:
     else:
         df["roc_composite"] = df["roc_fast"]
 
-    # --- Volume Indicators ---
+    # ═══════════════════════════════════════════════════════════════
+    # 6. VOLUME INDICATORS
+    # ═══════════════════════════════════════════════════════════════
     if df["volume"].sum() > 0:
         df["obv"] = ta.volume.on_balance_volume(df["close"], df["volume"])
 
@@ -136,7 +206,6 @@ def get_indicator_summary(df: pd.DataFrame) -> dict:
         return {}
 
     latest = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else latest
 
     summary = {
         "price": {
@@ -157,8 +226,15 @@ def get_indicator_summary(df: pd.DataFrame) -> dict:
             "adx_pos": _safe(latest.get("adx_pos")),
             "adx_neg": _safe(latest.get("adx_neg")),
         },
+        "directional": {
+            "di_plus": _safe(latest.get("di_plus")),
+            "di_minus": _safe(latest.get("di_minus")),
+            "dx": _safe(latest.get("dx")),
+        },
         "momentum": {
-            "rsi": _safe(latest.get("rsi")),
+            "kdj_k": _safe(latest.get("kdj_k")),
+            "kdj_d": _safe(latest.get("kdj_d")),
+            "kdj_j": _safe(latest.get("kdj_j")),
             "stoch_k": _safe(latest.get("stoch_k")),
             "stoch_d": _safe(latest.get("stoch_d")),
             "roc_fast": _safe(latest.get("roc_fast")),

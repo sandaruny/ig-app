@@ -1,9 +1,10 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from ig_client import IGClient
+from ig_client import IGClient, PriceAllowanceExhausted
 from strategy import TradingStrategy, Signal, TradeSignal
 from config import settings
+from price_cache import price_cache
 import database as db
 from sync_retry import sync_queue, SyncOp
 
@@ -120,6 +121,7 @@ class AutoTrader:
         self.running = False
         self._task: asyncio.Task | None = None
         self._forbidden_epics: set[str] = set()  # epics that returned 403 — skip on future cycles
+        self._allowance_error: str | None = None  # set when price allowance is exhausted
         # Load persisted trades from DB
         self._load_trades_from_db()
 
@@ -186,62 +188,139 @@ class AutoTrader:
                 logger.error("Trading loop error: %s", e, exc_info=True)
             await asyncio.sleep(settings.analysis_interval_seconds)
 
-    async def analyse_and_trade(self):
-        """Run analysis on all currency pairs and execute trades."""
+    async def analyse_and_trade(self, execute_trades: bool = True):
+        """Run analysis on all currency pairs and optionally execute trades.
+
+        Args:
+            execute_trades: If False, only analyse — do not open new positions.
+                            The bot loop passes True; the manual Analyse button passes False.
+        """
         open_positions = await self.client.get_open_positions()
         open_epics = {p["market"]["epic"] for p in open_positions}
 
         # Update existing trade records with live P&L
         self._update_trade_pnl(open_positions)
 
+        # Clear allowance error if the API allowance has been restored
+        if self._allowance_error and self.client.price_allowance.get("remaining") not in (None, 0):
+            logger.info("Price allowance restored — clearing error state")
+            self._allowance_error = None
+
         for epic in settings.currency_pairs:
             if epic in self._forbidden_epics:
                 continue  # Already confirmed no access — skip silently
             try:
-                await self._analyse_pair(epic, open_epics)
+                await self._analyse_pair(epic, open_epics, execute_trades=execute_trades)
+            except PriceAllowanceExhausted as e:
+                # Allowance exhausted — mark ALL remaining markets and stop
+                logger.error("Price allowance exhausted: %s", e)
+                self._allowance_error = str(e)
+                for ep in settings.currency_pairs:
+                    if ep not in self.market_data or self.market_data[ep].get("marketStatus") not in ("FORBIDDEN",):
+                        self.market_data[ep] = {
+                            "epic": ep,
+                            "instrumentName": self.market_data.get(ep, {}).get("instrumentName", ep),
+                            "marketStatus": "ALLOWANCE_EXHAUSTED",
+                            "error": str(e),
+                            "lastAnalysed": datetime.now(timezone.utc).isoformat(),
+                        }
+                return  # Stop analysing more pairs this cycle
             except Exception as e:
                 logger.error("Error analysing %s: %s", epic, e)
 
-    async def _analyse_pair(self, epic: str, open_epics: set):
-        """Analyse a single currency pair."""
+    async def _analyse_pair(self, epic: str, open_epics: set, execute_trades: bool = True):
+        """Analyse a single currency pair and optionally execute a trade."""
         import httpx
 
-        # Fetch price data
-        # 403 = account can't access this epic (permanent)
-        # 401 = session expired (auto-reauth should have handled it, but report if not)
-        try:
-            prices = await self.client.get_prices(epic, resolution="HOUR", num_points=50)
-        except httpx.HTTPStatusError as e:
-            status = e.response.status_code
-            if status == 403:
-                self._forbidden_epics.add(epic)
-                logger.warning(
-                    "403 Forbidden for %s — your account does not have access to "
-                    "this market. Marked as forbidden; will not retry until removed and re-added.",
+        resolution = "DAY"
+
+        # ── Fetch price data using the local cache ──
+        # First cycle: full fetch (35 candles = 35 API points)
+        # Subsequent cycles: delta fetch (2-4 candles = 2-4 points)
+        # This reduces weekly API point consumption by ~95%.
+        prices = None
+        fetch_params = price_cache.get_fetch_params(epic, resolution, full_count=35)
+
+        if not price_cache.needs_refresh(epic, resolution):
+            # Cache is fresh enough — skip the API call entirely
+            prices = price_cache.get_prices_response(epic)
+            logger.debug("Using cached prices for %s (%d candles, no API call)",
+                         epic, len(prices.get("prices", [])))
+        else:
+            # Need to fetch from IG API
+            try:
+                raw = await self.client.get_prices(
                     epic,
+                    resolution=resolution,
+                    num_points=fetch_params["num_points"],
                 )
-                self.market_data[epic] = {
-                    "epic": epic,
-                    "instrumentName": self.market_data.get(epic, {}).get("instrumentName", epic),
-                    "marketStatus": "FORBIDDEN",
-                    "error": "No access — remove this market from your watchlist",
-                    "lastAnalysed": datetime.now(timezone.utc).isoformat(),
-                }
-                return
-            if status == 401:
-                logger.error(
-                    "401 Unauthorized for %s — session expired and re-auth failed",
-                    epic,
-                )
-                self.market_data[epic] = {
-                    "epic": epic,
-                    "instrumentName": self.market_data.get(epic, {}).get("instrumentName", epic),
-                    "marketStatus": "SESSION_EXPIRED",
-                    "error": "Session expired — please re-login",
-                    "lastAnalysed": datetime.now(timezone.utc).isoformat(),
-                }
-                return
-            raise
+                price_cache.update(epic, resolution, raw, fetch_params["mode"])
+                prices = price_cache.get_prices_response(epic)
+            except PriceAllowanceExhausted:
+                # Try to use stale cache if available
+                cached = price_cache.get_cached(epic, resolution)
+                if cached:
+                    logger.warning(
+                        "Allowance exhausted but using stale cache for %s (%d candles)",
+                        epic, len(cached.get("prices", [])),
+                    )
+                    prices = price_cache.get_prices_response(epic)
+                else:
+                    raise  # No cache — propagate to outer handler
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status == 403:
+                    # Check if this is actually an allowance error
+                    error_code = ""
+                    try:
+                        error_code = e.response.json().get("errorCode", "")
+                    except Exception:
+                        pass
+                    if "allowance" in error_code.lower() or "exceeded" in error_code.lower():
+                        # Try stale cache first
+                        cached = price_cache.get_cached(epic, resolution)
+                        if cached:
+                            logger.warning(
+                                "Allowance exhausted (403) but using stale cache for %s",
+                                epic,
+                            )
+                            prices = price_cache.get_prices_response(epic)
+                        else:
+                            raise PriceAllowanceExhausted(
+                                remaining=0,
+                                total=self.client.price_allowance.get("total", 10000),
+                                expiry_secs=self.client.price_allowance.get("expiry_secs"),
+                            )
+                    else:
+                        self._forbidden_epics.add(epic)
+                        price_cache.invalidate(epic)
+                        logger.warning(
+                            "403 Forbidden for %s (errorCode=%s) — marked as forbidden.",
+                            epic, error_code or "unknown",
+                        )
+                        self.market_data[epic] = {
+                            "epic": epic,
+                            "instrumentName": self.market_data.get(epic, {}).get("instrumentName", epic),
+                            "marketStatus": "FORBIDDEN",
+                            "error": f"No access ({error_code or '403'}) — remove this market from your watchlist",
+                            "lastAnalysed": datetime.now(timezone.utc).isoformat(),
+                        }
+                        return
+                elif status == 401:
+                    logger.error(
+                        "401 Unauthorized for %s — session expired and re-auth failed",
+                        epic,
+                    )
+                    self.market_data[epic] = {
+                        "epic": epic,
+                        "instrumentName": self.market_data.get(epic, {}).get("instrumentName", epic),
+                        "marketStatus": "SESSION_EXPIRED",
+                        "error": "Session expired — please re-login",
+                        "lastAnalysed": datetime.now(timezone.utc).isoformat(),
+                    }
+                    return
+                # Other HTTP error — re-raise
+                raise
 
         # Get market details for context
         try:
@@ -255,8 +334,9 @@ class AutoTrader:
         except Exception:
             market = {}
 
-        # Run strategy
-        signal = self.strategy.analyse(prices)
+        # Run strategy with per-epic ROC period
+        roc_period = db.get_epic_roc_period(epic, default=20)
+        signal = self.strategy.analyse(prices, roc_period=roc_period)
 
         # Store market data for the dashboard
         market_snapshot = market.get("snapshot") or {}
@@ -292,7 +372,19 @@ class AutoTrader:
             "lastAnalysed": datetime.now(timezone.utc).isoformat(),
         }
 
-        # Execute trade if signal is strong enough and no existing position
+        # Enrich signal with converted stop/limit in IG points for the UI
+        if signal.stop_distance > 0:
+            stop_pts = self._convert_to_points(signal.stop_distance, epic)
+            limit_pts = self._convert_to_points(signal.limit_distance, epic)
+            stop_pts = self._ensure_min_stop(stop_pts, epic)
+            if limit_pts < stop_pts:
+                limit_pts = stop_pts * 2.0
+            self.market_data[epic]["signal"]["stop_points"] = round(stop_pts, 1)
+            self.market_data[epic]["signal"]["limit_points"] = round(limit_pts, 1)
+
+        # Execute trade if signal is strong enough, no existing position, and trading is enabled
+        if not execute_trades:
+            return
         if signal.direction != Signal.HOLD and epic not in open_epics:
             if len(open_epics) >= settings.max_open_positions:
                 logger.info("Max positions reached, skipping %s", epic)
@@ -652,6 +744,7 @@ class AutoTrader:
                         direction, size, epic, open_level, pnl or 0, deal_id)
 
     def get_state(self) -> dict:
+        allowance = self.client.price_allowance if self.client else {}
         return {
             "running": self.running,
             "trades": [t.to_dict() for t in self.trades],
@@ -660,4 +753,11 @@ class AutoTrader:
             "closedTradeCount": sum(1 for t in self.trades if t.status == "CLOSED"),
             "forbiddenEpics": list(self._forbidden_epics),
             "syncRetry": sync_queue.get_status(),
+            "priceAllowance": {
+                "remaining": allowance.get("remaining"),
+                "total": allowance.get("total", 10000),
+                "expirySecs": allowance.get("expiry_secs"),
+            },
+            "allowanceError": self._allowance_error,
+            "priceCache": price_cache.get_stats(),
         }

@@ -42,6 +42,26 @@ export default function MarketDetail({ epic, market, onClose }) {
   const [priceData, setPriceData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [resolution, setResolution] = useState('HOUR');
+  const [rocPeriod, setRocPeriod] = useState(20);
+  const [rocSaving, setRocSaving] = useState(false);
+
+  // Load per-epic ROC config
+  useEffect(() => {
+    api.getEpicConfig(epic).then((c) => setRocPeriod(c.rocPeriod || 20)).catch(() => {});
+  }, [epic]);
+
+  const handleRocSave = async (newVal) => {
+    const v = Math.max(5, Math.min(100, parseInt(newVal) || 20));
+    setRocPeriod(v);
+    setRocSaving(true);
+    try {
+      await api.updateEpicConfig(epic, { rocPeriod: v });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setRocSaving(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -226,14 +246,22 @@ export default function MarketDetail({ epic, market, onClose }) {
                   {signal.direction}
                 </span>
                 <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                  Confidence: <strong style={{ color: 'var(--accent-yellow)' }}>{(signal.confidence * 100).toFixed(0)}%</strong>
+                  Confidence: <strong style={{ color: 'var(--accent-yellow)' }}>{(signal.confidence * 100).toFixed(1)}%</strong>
                 </span>
-                <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                  SL: <strong style={{ color: 'var(--accent-red)' }}>{signal.stop_distance}</strong>
-                </span>
-                <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                  TP: <strong style={{ color: 'var(--accent-green)' }}>{signal.limit_distance}</strong>
-                </span>
+                {(signal.stop_points != null || signal.stop_distance > 0) && (
+                  <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                    SL: <strong style={{ color: 'var(--accent-red)' }}>
+                      {signal.stop_points != null ? `${signal.stop_points} pts` : signal.stop_distance?.toFixed(5)}
+                    </strong>
+                  </span>
+                )}
+                {(signal.limit_points != null || signal.limit_distance > 0) && (
+                  <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                    TP: <strong style={{ color: 'var(--accent-green)' }}>
+                      {signal.limit_points != null ? `${signal.limit_points} pts` : signal.limit_distance?.toFixed(5)}
+                    </strong>
+                  </span>
+                )}
               </div>
 
               {signal.reasons?.length > 0 && (
@@ -252,6 +280,30 @@ export default function MarketDetail({ epic, market, onClose }) {
             </div>
           )}
 
+          {/* ROC Period Config */}
+          <div
+            className="rounded-xl p-3 flex items-center gap-3"
+            style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}
+          >
+            <span className="text-xs font-semibold" style={{ color: 'var(--text-secondary)' }}>
+              ROC Period:
+            </span>
+            <input
+              type="number"
+              min="5"
+              max="100"
+              value={rocPeriod}
+              onChange={(e) => setRocPeriod(parseInt(e.target.value) || 20)}
+              onBlur={(e) => handleRocSave(e.target.value)}
+              className="w-16 px-2 py-1 rounded text-sm font-mono text-center text-white outline-none"
+              style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}
+            />
+            <span className="text-[10px]" style={{ color: 'var(--text-secondary)' }}>
+              Fast={Math.max(5, Math.floor(rocPeriod / 2))} / Med={rocPeriod} / Slow={rocPeriod * 2}
+              {rocSaving && <span className="ml-2 text-blue-400">saving...</span>}
+            </span>
+          </div>
+
           {/* Indicator Details */}
           {indicators && (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -265,27 +317,48 @@ export default function MarketDetail({ epic, market, onClose }) {
                   { label: 'MACD Signal', value: indicators.trend?.macd_signal },
                   { label: 'MACD Hist', value: indicators.trend?.macd_histogram },
                   { label: 'ADX', value: indicators.trend?.adx },
-                  { label: 'DI+', value: indicators.trend?.adx_pos },
-                  { label: 'DI-', value: indicators.trend?.adx_neg },
                 ]}
               />
               <IndicatorSection
-                title="Momentum"
+                title="Directional Movement"
                 items={[
                   {
-                    label: 'RSI(14)',
-                    value: indicators.momentum?.rsi,
+                    label: 'DI+',
+                    value: indicators.directional?.di_plus,
+                    color: indicators.directional?.di_plus > indicators.directional?.di_minus
+                      ? 'var(--accent-green)' : undefined,
+                  },
+                  {
+                    label: 'DI-',
+                    value: indicators.directional?.di_minus,
+                    color: indicators.directional?.di_minus > indicators.directional?.di_plus
+                      ? 'var(--accent-red)' : undefined,
+                  },
+                  { label: 'DX', value: indicators.directional?.dx },
+                ]}
+              />
+              <IndicatorSection
+                title="KDJ Indicator"
+                items={[
+                  { label: 'K', value: indicators.momentum?.kdj_k },
+                  { label: 'D', value: indicators.momentum?.kdj_d },
+                  {
+                    label: 'J',
+                    value: indicators.momentum?.kdj_j,
                     color:
-                      indicators.momentum?.rsi > 70
-                        ? 'var(--accent-red)'
-                        : indicators.momentum?.rsi < 30
-                        ? 'var(--accent-green)'
-                        : undefined,
+                      indicators.momentum?.kdj_j > 100 ? 'var(--accent-red)'
+                      : indicators.momentum?.kdj_j < 0 ? 'var(--accent-green)'
+                      : undefined,
                   },
                   { label: 'Stoch %K', value: indicators.momentum?.stoch_k },
                   { label: 'Stoch %D', value: indicators.momentum?.stoch_d },
+                ]}
+              />
+              <IndicatorSection
+                title={`Rate of Change (period: ${rocPeriod})`}
+                items={[
                   {
-                    label: 'ROC Fast(9)',
+                    label: `ROC Fast(${Math.max(5, Math.floor(rocPeriod / 2))})`,
                     value: indicators.momentum?.roc_fast != null
                       ? `${indicators.momentum.roc_fast > 0 ? '+' : ''}${indicators.momentum.roc_fast.toFixed(3)}%`
                       : null,
@@ -294,10 +367,9 @@ export default function MarketDetail({ epic, market, onClose }) {
                       : indicators.momentum?.roc_fast < 0
                       ? 'var(--accent-red)'
                       : undefined,
-                    rawValue: indicators.momentum?.roc_fast,
                   },
                   {
-                    label: 'ROC Med(14)',
+                    label: `ROC Med(${rocPeriod})`,
                     value: indicators.momentum?.roc_medium != null
                       ? `${indicators.momentum.roc_medium > 0 ? '+' : ''}${indicators.momentum.roc_medium.toFixed(3)}%`
                       : null,
@@ -306,10 +378,9 @@ export default function MarketDetail({ epic, market, onClose }) {
                       : indicators.momentum?.roc_medium < 0
                       ? 'var(--accent-red)'
                       : undefined,
-                    rawValue: indicators.momentum?.roc_medium,
                   },
                   {
-                    label: 'ROC Slow(30)',
+                    label: `ROC Slow(${rocPeriod * 2})`,
                     value: indicators.momentum?.roc_slow != null
                       ? `${indicators.momentum.roc_slow > 0 ? '+' : ''}${indicators.momentum.roc_slow.toFixed(3)}%`
                       : null,
@@ -318,7 +389,6 @@ export default function MarketDetail({ epic, market, onClose }) {
                       : indicators.momentum?.roc_slow < 0
                       ? 'var(--accent-red)'
                       : undefined,
-                    rawValue: indicators.momentum?.roc_slow,
                   },
                   {
                     label: 'ROC Composite',
@@ -330,7 +400,6 @@ export default function MarketDetail({ epic, market, onClose }) {
                       : indicators.momentum?.roc_composite < 0
                       ? 'var(--accent-red)'
                       : undefined,
-                    rawValue: indicators.momentum?.roc_composite,
                   },
                 ]}
               />
